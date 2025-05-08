@@ -1,14 +1,8 @@
 ### Setup env
 library(tidyverse)
-library(vegan)
-library(parallelDist)
-library(ggpubr)
-library(rstatix)
-library(ggpmisc)
 library(patchwork)
-library(hexbin)
 
-source('scripts/MFD_colors.R')
+# source('scripts/MFD_colors.R')
 
 setwd("/mfd_abundance_tables")
 
@@ -16,12 +10,16 @@ setwd("/mfd_abundance_tables")
 
 ### Import data files
 ## Read observational table
-table <- data.table::fread('data/2024-03-07_arcbac-rarefaction-rel.csv')
+data <- data.table::fread('data/2025-02-13_MFD_arcbac_genus_rarefaction_rel.csv')
 
-## Read sample metadata
-metadata <- data.table::fread('data/2024-03-07_MFD_combined_metadata.csv', na.strings = "") %>%
-  mutate(across(mfd_hab1, ~str_replace(., "Sclerophyllous scrub", "Temperate heath and scrub")),
-         across(mfd_hab2, ~str_replace(., "Scrub", "Sclerophyllous scrub")))
+metadata <- readxl::read_excel('data/2025-04-14_mfd_db.xlsx') %>%
+  filter(fieldsample_barcode %in% colnames(data)) %>%
+  relocate(coords_reliable, .after = "longitude") %>%
+  mutate(complex = str_c(mfd_sampletype, mfd_areatype, mfd_hab1, sep = ", "),
+         across(complex, ~factor(.))) %>%
+  mutate(across(mfd_sampletype, ~factor(., levels = c("Soil", "Sediment", "Water", "Other"))),
+         across(mfd_areatype, ~factor(., levels = c("Natural", "Subterranean", "Agriculture", "Urban")))) %>%
+  arrange(mfd_sampletype, mfd_areatype)
 
 ## Import metadata of grid representatives and subset based on MFDO1
 ###!! This section can be uncommented for a lighter dataset of 2k samples !!###
@@ -44,10 +42,24 @@ metadata <- data.table::fread('data/2024-03-07_MFD_combined_metadata.csv', na.st
 #         !is.na(lat)) %>%
 #  select(-project_id)
 
+## Calculate Hellinger-transformed Bray-Curtis dissimilarity in parallel
+bray.dist <- data %>%
+  filter(!Genus == "Unclassified") %>%
+  select(where(is.numeric), Genus) %>%
+  column_to_rownames(var = "Genus") %>%
+  t() %>% 
+  vegan::decostand(., method = "hellinger") %>%
+  parallelDist::parDist(., method = "bray", threads = 100) %>%
+  as.matrix() %>%
+  data.frame()
+
+## Save full Bray-Curtis matrix
+data.table::fwrite(bray.dist, sep = ",", row.names = TRUE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_BC_distance_full.csv"))
+
 ## Subset metadata based on coordinates and reliability
 metadata.sub <- metadata %>%
-  filter(fieldsample_barcode %in% colnames(table),
-         !is.na(mfd_hab1),
+  filter(!is.na(mfd_hab3),
          !is.na(longitude),
          !coords_reliable == "No")
 
@@ -59,7 +71,7 @@ samples.sub <- metadata.sub %>%
 #samples.sub.grid <- metadata.grid %>%
 #  pull(fieldsample_barcode)
 
-rm(metadata)
+rm(metadata, data)
 
 
 ### Calculate geographical distance
@@ -80,19 +92,19 @@ geo.dist.long <- geo.dist %>%
   rownames_to_column(var = "fieldsample_barcode") %>%
   pivot_longer(!fieldsample_barcode, names_to = "comparison", values_to = "geo_dist")
 
+
+### Evaluate individual projects with zero distances
 ## Remove samples which has zero geographical distance
 geo.dist.long.sub <- geo.dist.long %>%
   filter(!fieldsample_barcode == comparison) %>%
   filter(!geo_dist == 0) %>%
-  left_join(metadata.sub %>% select(fieldsample_barcode, project_id, coords_reliable, sitename, sampling_date, mfd_sampletype:mfd_hab3))
+  left_join(metadata.sub %>% select(fieldsample_barcode, project_id, coords_reliable, sitename, sampling_date, sampling_comment, mfd_sampletype:mfd_hab3))
 
-
-### Evaluate individual projects with zero distances
 ## Find samples with zero distance
 geo.dist.long.zero <- geo.dist.long %>%
   filter(!fieldsample_barcode == comparison) %>%
   filter(geo_dist == 0) %>%
-  left_join(metadata.sub %>% select(fieldsample_barcode, project_id, coords_reliable, sitename, sampling_date, mfd_sampletype:mfd_hab3)) %>%
+  left_join(metadata.sub %>% select(fieldsample_barcode, project_id, coords_reliable, sitename, sampling_date, sampling_comment, mfd_sampletype:mfd_hab3)) %>%
   arrange(project_id)
 
 rm(geo.dist.long)
@@ -112,12 +124,9 @@ geo.dist.long.zero.p11_2 <- geo.dist.long.zero %>%
   ungroup()
 
 ## P12_5
-p12_5 <- readxl::read_excel("data/P12_5_minimal_metadata.xlsx") %>%
-  filter(str_detect(sampling_comment, "surface")) %>%
-  pull(fieldsample_barcode)
-
 geo.dist.long.zero.p12_5 <- geo.dist.long.zero %>%
-  filter(fieldsample_barcode %in% p12_5)
+  filter(project_id %in% "P12_5") %>%
+  filter(str_detect(sampling_comment, "surface"))
 
 ## P13_3
 geo.dist.long.zero.p13_3 <- geo.dist.long.zero %>%
@@ -155,75 +164,82 @@ samples.filt <- metadata.sub %>%
         geo.dist.long.zero.p11_2 %>% select(fieldsample_barcode), 
         geo.dist.long.zero.p12_5 %>% select(fieldsample_barcode), 
         geo.dist.long.zero.p13_3 %>% select(fieldsample_barcode)) %>%
+  arrange(fieldsample_barcode) %>%
   pull(fieldsample_barcode) %>% 
   unique()
 
 ## Filter geographical distance matrix
 geo.dist.filt <- geo.dist %>%
   filter(rownames(.) %in% samples.filt) %>%
-  select(any_of(samples.filt))
+  select(all_of(samples.filt))
+
+bray.dist.filt <- bray.dist %>%
+  filter(rownames(.) %in% samples.filt) %>%
+  select(all_of(samples.filt))
 
 ## Write to disk
-data.table::fwrite(geo.dist.filt, "output/2024-03-21_spatial-distance-filtered-subset.csv")
+data.table::fwrite(geo.dist.filt, sep = ",", row.names = TRUE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_spatial_distance_filtered.csv"))
 
-## Filter metadata
+data.table::fwrite(bray.dist.filt, sep = ",", row.names = TRUE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_BC_distance_filtered.csv"))
+
+
+### Filter metadata
 metadata.filt <- metadata.sub %>%
   # filter(fieldsample_barcode %in% samples.sub.grid) %>%
   filter(fieldsample_barcode %in% samples.filt) %>%
-  select(fieldsample_barcode, mfd_sampletype:mfd_hab3)
+  select(fieldsample_barcode, mfd_sampletype:mfd_hab3) %>%
+  arrange(fieldsample_barcode)
 
 ## Write to disk
-data.table::fwrite(metadata.filt, "output/2024-03-21_metadata-filtered-subset.csv")
+data.table::fwrite(metadata.filt, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_metadata_dd_filtered_subset.tsv"))
 
 ## Clean
 rm(geo.dist, geo.dist.long.sub, geo.dist.long.zero, geo.dist.long.zero.ok, geo.dist.long.zero.p04_3, 
-   geo.dist.long.zero.p11_2, geo.dist.long.zero.p12_5, geo.dist.long.zero.p13_3, metadata.sub)
+   geo.dist.long.zero.p11_2, geo.dist.long.zero.p12_5, geo.dist.long.zero.p13_3, metadata.sub, bray.dist)
 
 
-### Get total number of 16S reads in filtered dataset
-table.counts <- data.table::fread('../format_data/output/2024-03-07_arcbac-rarefaction-count.csv')
-
-## Calculate total counts
-total.count <- table.counts %>%
-  # select(any_of(samples.sub.grid), Genus) %>%
-  select(any_of(samples.filt), Genus) %>%
-  filter(rowSums(across(where(is.numeric)))!=0) %>%
-  filter(!Genus == "Unclassified") %>%
-  column_to_rownames(var = "Genus") %>%
-  colSums() %>%
-  sum()
-
-
-### Bray-Curtis dissimilarity calculations
-bray.dist <- table %>%
-  # select(any_of(samples.sub.grid), Genus) %>%
-  select(any_of(samples.filt), Genus) %>%
-  filter(rowSums(across(where(is.numeric)))!=0) %>%
-  filter(!Genus == "Unclassified") %>%
-  column_to_rownames(var = "Genus") %>%
-  t() %>%
-  decostand(., method = "hellinger") %>%
-  parallelDist::parDist(., method = "bray", threads = 100) %>%
-  as.matrix() %>%
-  data.frame()
-
-data.table::fwrite(bray.dist, "output/2024-03-21_BC-distance-filtered-subset.csv")
-
-rm(table)
-
-## Transform to long format
+### Filter comparisons to self and duplicates + make long format
+## Cange spatial to long format and ad pseudo-count 0f 0.1 m
 geo.dist.long <- geo.dist.filt %>%
   rownames_to_column(var = "fieldsample_barcode") %>%
   pivot_longer(!fieldsample_barcode, names_to = "comp", values_to = "geo_dist") %>%
   filter(!fieldsample_barcode == comp) %>%
-  mutate(across(geo_dist, ~.+0.0001))
+  mutate(tmp1 = str_remove(fieldsample_barcode, "MFD"),
+         tmp2 = str_remove(comp, "MFD"),
+         across(tmp1:tmp2, ~as.numeric(.)),
+         tmp3 = case_when(tmp1 < tmp2 ~ tmp1,
+                          tmp1 > tmp2 ~ tmp2),
+         tmp4 = case_when(tmp1 > tmp2 ~ tmp1,
+                          tmp1 < tmp2 ~ tmp2),
+         across(fieldsample_barcode, ~str_c("MFD", str_pad(tmp3, width = 5, side = "left", pad = "0"))),
+         across(comp, ~str_c("MFD", str_pad(tmp4, width = 5, side = "left", pad = "0")))) %>%
+  select(-c(tmp1:tmp4)) %>%
+  distinct() %>%
+  mutate(across(geo_dist, ~.+0.0001)) %>%
+  arrange(fieldsample_barcode, comp)
+
 
 ## Change BC to long format and change from BC dissimilarity to simmilarity
-bray.dist.long <- bray.dist %>%
+bray.dist.long <- bray.dist.filt %>%
   rownames_to_column(var = "fieldsample_barcode") %>%
   pivot_longer(!fieldsample_barcode, names_to = "comp", values_to = "bray_dist") %>%
   mutate(across(bray_dist, ~1-.)) %>%
-  filter(!fieldsample_barcode == comp)
+  filter(!fieldsample_barcode == comp) %>%
+  mutate(tmp1 = str_remove(fieldsample_barcode, "MFD"),
+         tmp2 = str_remove(comp, "MFD"),
+         across(tmp1:tmp2, ~as.numeric(.)),
+         tmp3 = case_when(tmp1 < tmp2 ~ tmp1,
+                          tmp1 > tmp2 ~ tmp2),
+         tmp4 = case_when(tmp1 > tmp2 ~ tmp1,
+                          tmp1 < tmp2 ~ tmp2),
+         across(fieldsample_barcode, ~str_c("MFD", str_pad(tmp3, width = 5, side = "left", pad = "0"))),
+         across(comp, ~str_c("MFD", str_pad(tmp4, width = 5, side = "left", pad = "0")))) %>%
+  select(-c(tmp1:tmp4)) %>%
+  distinct() %>%
+  arrange(fieldsample_barcode, comp)
 
 ## Combine BC and spatial distances
 df.long.comb <- bray.dist.long %>%
@@ -245,46 +261,36 @@ df.long.comb <- bray.dist.long %>%
          comparison_areatype = case_when(sample_areatype == comp_areatype & sample_sampletype == comp_sampletype ~ "Within",
                                          TRUE ~ "Between"),
          comparison_MFDO1 = case_when(sample_areatype == comp_areatype & sample_sampletype == comp_sampletype & sample_hab1 == comp_hab1 ~ "Within",
-                                     TRUE ~ "Between"),
+                                      TRUE ~ "Between"),
          comparison_MFDO2 = case_when(sample_areatype == comp_areatype & sample_sampletype == comp_sampletype & sample_hab1 == comp_hab1 & sample_hab2 == comp_hab2 ~ "Within",
-                                     TRUE ~ "Between"),
+                                      TRUE ~ "Between"),
          comparison_MFDO3 = case_when(sample_areatype == comp_areatype & sample_sampletype == comp_sampletype & sample_hab1 == comp_hab1 & sample_hab2 == comp_hab2 & sample_hab3 == comp_hab3 ~ "Within",
-                                     TRUE ~ "Between")) %>%
+                                      TRUE ~ "Between")) %>%
   pivot_longer(!fieldsample_barcode:comp_hab3, names_to = "comparison_level", values_to = "comparison_type") %>%
-  filter(!c(comparison_level == "comparison_MFDO1" & is.na(sample_hab1)),
+  filter(!c(comparison_level == "comparison_sampletype" & is.na(sample_sampletype)),
+         !c(comparison_level == "comparison_sampletype" & is.na(comp_sampletype)),
+         !c(comparison_level == "comparison_areatype" & is.na(sample_areatype)),
+         !c(comparison_level == "comparison_areatype" & is.na(comp_areatype)),
+         !c(comparison_level == "comparison_MFDO1" & is.na(sample_hab1)),
          !c(comparison_level == "comparison_MFDO1" & is.na(comp_hab1)),
          !c(comparison_level == "comparison_MFDO2" & is.na(sample_hab2)),
          !c(comparison_level == "comparison_MFDO2" & is.na(comp_hab2)),
          !c(comparison_level == "comparison_MFDO3" & is.na(sample_hab3)),
          !c(comparison_level == "comparison_MFDO3" & is.na(comp_hab3)))
-         
+
 rm(geo.dist.long, bray.dist.long)
 
 ## Set levels for types of comparisons
 levels <- c("comparison_sampletype", "comparison_areatype", "comparison_MFDO1", "comparison_MFDO2", "comparison_MFDO3")
 
 ## Filter the dataset
-data <- df.long.comb %>%
+model.data <- df.long.comb %>%
   mutate(across(comparison_level, ~factor(., levels = levels)),
          across(comparison_type, ~factor(., levels = c("Within", "Between")))) %>%
   filter(geo_dist <= 300)
 
-## Evaluate the size of the dataset
-data %>%
-  pull(fieldsample_barcode) %>%
-  unique() %>%
-  length()
-
-data %>%
-  pull(comp) %>%
-  unique() %>%
-  length()
-
-## Write to disk
-data.table::fwrite(data, "output/2024-03-21_dd_long.csv")
-
 ## Clean env
-rm(df.long.comb, metadata.grid)
+rm(df.long.comb)
 
 gc()
 
@@ -302,7 +308,7 @@ midcut <- function(x, from, to, by){
 }
 
 ## Summarise data at 1 km binsize
-data.sum.1km <- data %>%
+data.sum.1km <- model.data %>%
   mutate(geo_bin = midcut(geo_dist, 0, 300, 1)) %>%
   group_by(geo_bin, comparison_level, comparison_type) %>%
   summarise(n = n(),
@@ -312,7 +318,7 @@ data.sum.1km <- data %>%
   ungroup()
 
 ## Summarise data at 5 km binsize
-data.sum.5km <- data %>%
+data.sum.5km <- model.data %>%
   mutate(geo_bin = midcut(geo_dist, 0, 300, 5)) %>%
   group_by(geo_bin, comparison_level, comparison_type) %>%
   summarise(n = n(),
@@ -322,11 +328,13 @@ data.sum.5km <- data %>%
   ungroup()
 
 ## Write summaries to disk
-data.table::fwrite(data.sum.1km, "output/2024-03-21_dd-sum-binsize1.csv")
-data.table::fwrite(data.sum.5km, "output/2024-03-21_dd-sum-binsize5.csv")
+data.table::fwrite(data.sum.1km, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_dd_sum_binsize1km.tsv"))
+data.table::fwrite(data.sum.5km, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_dd_sum_binsize5km.tsv"))
 
 ## Fit log decay on data nested by ontology levels and type of comparison
-tidy.log <- data %>%
+tidy.log <- model.data %>%
   nest(data = c(-comparison_level, -comparison_type)) %>%
   mutate(model = map(data, ~lm(bray_dist ~ log(geo_dist), data = .)), tidied = map(model, broom::tidy, conf.int = TRUE, conf.level = 0.95)) %>%
   unnest(tidied)
@@ -339,7 +347,8 @@ tidy.log.df <- tidy.log %>%
   select(-c(model, data))
 
 ## Write model statisitcs to file
-data.table::fwrite(tidy.log.df, "output/2024-03-21_tidy-stats.csv")
+data.table::fwrite(tidy.log.df, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_dd_model_stats.tsv"))
 
 
 ## Write summary function to calculate R^2 for the models
@@ -384,7 +393,7 @@ models <- tidy.log.df %>%
   rename(a = `log(geo_dist)`,
          b = `(Intercept)`) %>%
   ungroup() %>%
-  mutate(x = 200,
+  mutate(x = 110,
          y = 0.95)
 
 ## Create dataframe of predicted values of BC similarity
@@ -398,7 +407,9 @@ data.pred <- models %>%
   mutate(bray_dist = a * log(geo_dist) + b)
 
 ## Write to disk
-data.table::fwrite(data.pred, "output/2024-03-21_dd_predictions.csv")
+data.table::fwrite(data.pred, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_dd_model_predictions.tsv"))
+
 
 
 ### Visualisation
@@ -408,24 +419,31 @@ plot.decay.sum <- ggplot(data = data.pred, aes(x = geo_dist, y = bray_dist, grou
   geom_point(data = data.sum.5km, aes(x = geo_bin, y = mean, fill = comparison_type), shape = 21, color = "black", alpha = 1) +
   scale_x_continuous(breaks = seq(0, 300, 30), name = "Geographial distance, km") +
   scale_y_continuous("Bray-Curtis similarity", limits = c(-0.01, 0.6), breaks = seq(0, 0.6, 0.1)) +
-  facet_grid(cols = vars(comparison_level)) +
-  guides(color = guide_legend(title = "Comparison"),
-         fill = guide_legend(title = "Comparison"),
-         linetype = guide_legend(title = "Comparison")) +
+  facet_grid(cols = vars(comparison_level),
+             labeller = labeller(comparison_level = c("comparison_sampletype" = "Sample type", 
+                                                      "comparison_areatype" = "Area type", 
+                                                      "comparison_MFDO1" = "MFDO1", 
+                                                      "comparison_MFDO2" = "MFDO2", 
+                                                      "comparison_MFDO3" = "MFDO3"))) +
+  guides(color = guide_legend(title = "Comparison data"),
+         fill = guide_legend(title = "Comparison data", override.aes = list(size = 4))) +
   theme_bw(base_size = 18) +
   theme(axis.text.x = element_blank(),
         axis.title.x = element_blank(),
         panel.grid.minor.x = element_blank())
 
 ## Create filtered dataset for plotting with hexbin
-data.all.filt <- data %>% 
+data.all.filt <- model.data %>% 
   mutate(geo_bin = midcut(geo_dist, 0, 300, 1)) %>%
-  group_by(geo_bin, comparison_level, comparison_type) %>%
-  ungroup() %>%
+  # group_by(geo_bin, comparison_level, comparison_type) %>%
+  # ungroup() %>%
   left_join(data.sum.1km, by = c("geo_bin", "comparison_level", "comparison_type"))
 
 ## Write to disk
-data.table::fwrite(data.all.filt, "output/2024-03-21_dd_long_filt.csv")
+data.table::fwrite(data.all.filt, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE,
+                   paste0("output/", format(Sys.time(), "%Y-%m-%d"), "_MFD_dd_long_format.tsv"))
+
+rm(model.data)
 
 gc()
 
@@ -441,7 +459,7 @@ plot.decay.hex <- ggplot(data = data.pred, aes(x = geo_dist, y = bray_dist)) +
   scale_fill_viridis_c(option = "magma", transform = "log10", breaks = c(0.00001, 0.0001, 0.001, 0.01)) +
   facet_grid(cols = vars(comparison_level),
              rows = vars(comparison_type)) +
-  guides(fill = guide_colorbar(title = "Binned porportion")) +
+  guides(fill = guide_colorbar(title = "Binned proportion", theme(legend.title.position = "top"))) +
   theme_bw(base_size = 18) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
         strip.background = element_blank(),
@@ -453,8 +471,14 @@ plot.decay.hex <- ggplot(data = data.pred, aes(x = geo_dist, y = bray_dist)) +
 ## Create density curves to visualise the data distributions for comparions within and between
 ## the different levels of the ontology
 plot.decay.density <- ggplot() +
-  geom_density(data = data.all.filt, aes(x = bray_dist)) +
-  scale_x_continuous(breaks = seq(-0.01, 1, 0.1), name = "") +
+  geom_density(data = data.all.filt, aes(x = bray_dist, linetype = comparison_level), show.legend = FALSE) +
+  stat_density(data = data.all.filt, aes(x = bray_dist, linetype = comparison_level),
+               geom = "line", position = "identity", linewidth = 0) + 
+  guides(linetype = guide_legend(title = "Comparison type", 
+                                 labels = c("Sample type", "Area type", "MFDO1", "MFDO2", "MFDO3"),
+                                 theme(legend.title.position = "top"), 
+                                 override.aes = list(linewidth = 1))) +
+  scale_x_continuous(limits = c(-0.01, 1), breaks = seq(0, 1, 0.1), name = "") +
   # scale_y_continuous("Bray-Curtis similarity", limits = c(-0.01, 1), breaks = seq(0, 1, 0.1)) +
   facet_grid(rows = vars(comparison_type)) +
   coord_flip() +
@@ -465,31 +489,41 @@ plot.decay.density <- ggplot() +
 
 ## Customise plot layout
 design <- "
-11111#
+111114
 222223
 222223"
 
 ## Arrange plots
-ggarranged <- plot.decay.sum + plot.decay.hex + plot.decay.density + 
-  plot_layout(design = design, guides = "collect") & theme(legend.position = "bottom")
+ggarranged <- plot.decay.sum + plot.decay.hex + plot.decay.density + guide_area() + 
+  plot_layout(design = design, guides = "collect")
+
+gc()
 
 ## Save plots to disk
-png(file = 'output/dd-all.png',
+png(file = 'output/distance_decay.png',
     width = 1900,
     height = 1200)
 ggarranged
 dev.off()
 
-pdf(file = 'output/dd-all.pdf',
+pdf(file = 'output/distance_decay.pdf',
+    width = 19,
+    height = 12)
+ggarranged
+dev.off()
+
+tiff(file = 'output/distance_decay.tiff',
+     width = 1900,
+     height = 1200)
+ggarranged
+dev.off()
+
+jpeg(file = 'output/distance_decay.jpeg',
     width = 1900,
     height = 1200)
 ggarranged
 dev.off()
 
-tiff(file = 'output/dd-all.tiff',
-    width = 1900,
-    height = 1200)
-ggarranged
-dev.off()
+ggsave("output/distance_decay.svg", plot = ggarranged, width = 19, height = 12, units = "in", dpi = "retina")
 
-ggsave("output/dd-all.svg", plot = ggarranged, width = 19, height = 12, units = "in", dpi = "retina")
+# save.image(paste0('output/', format(Sys.time(), "%Y-%m-%d"), "_MFD_distance_decay.RData"))
